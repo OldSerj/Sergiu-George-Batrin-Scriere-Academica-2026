@@ -1,338 +1,395 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
+// ================================================================
+//  main.cpp  –  Multi-Type Parallel Sorting Benchmark
+//
+//  Compile (GCC / Clang / WSL / MinGW-w64):
+//    g++ -O2 -std=c++17 -pthread main.cpp -o sort_bench
+//
+//  Compile (MSVC, Developer Command Prompt):
+//    cl /O2 /std:c++17 main.cpp
+//
+//  Run:
+//    ./sort_bench          (Linux / macOS / WSL)
+//    sort_bench.exe        (Windows)
+//
+//  Output:
+//    sorting_results.csv
+// AMD Ryzen AI 9 HX 370 w/ Radeon 890M (2.00 GHz)
+// 12 cores / 24 threads
+// ================================================================
 
-#ifdef _WIN32
-#include <windows.h>
+#include <algorithm>
+#include <chrono>
+#include <climits>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <random>
+#include <string>
+#include <thread>
+#include <vector>
 
+static constexpr int N_THREADS    = 24;
+static constexpr int N2_THRESHOLD = 10'000;
+static constexpr int PAR_MIN      = 2'048;
 
-// ======================================================
-// HIGH‑PRECISION TIMER
-// ======================================================
+static const std::vector<int> SIZES = {
+    20, 50, 100, 500,
+    1'000, 5'000, 10'000,
+    50'000, 100'000, 500'000,
+    1'000'000, 5'000'000, 10'000'000
+};
 
-double measure(void (*f)(int[], int), int arr[], int n) {
-    LARGE_INTEGER freq, start, end;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&start);
-
-    f(arr, n);
-
-    QueryPerformanceCounter(&end);
-    return (double)(end.QuadPart - start.QuadPart) / freq.QuadPart;
+template<typename Fn>
+static double measure_ms(Fn&& fn) {
+    using Clock = std::chrono::high_resolution_clock;
+    auto t0 = Clock::now();
+    fn();
+    return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
 
-#else
-#define _POSIX_C_SOURCE 199309L
-#include <time.h>
-
-double measure(void (*f)(int[], int), int arr[], int n) {
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    f(arr, n);
-    clock_gettime(CLOCK_MONOTONIC, &end);
-
-    return (end.tv_sec - start.tv_sec)
-         + (end.tv_nsec - start.tv_nsec) / 1e9;
-}
-#endif
-
-// ======================================================
-// SORTING ALGORITHMS
-// ======================================================
-
-// Insertion Sort
-void insertionSort(int arr[], int n) {
-    for (int i = 1; i < n; i++) {
-        int key = arr[i];
+template<typename T>
+static void insertionSort(T* a, int n) {
+    for (int i = 1; i < n; ++i) {
+        T key = a[i];
         int j = i - 1;
-        while (j >= 0 && arr[j] > key) {
-            arr[j + 1] = arr[j];
-            j--;
-        }
-        arr[j + 1] = key;
+        while (j >= 0 && a[j] > key) { a[j+1] = a[j]; --j; }
+        a[j+1] = key;
+    }
+}
+template<typename T>
+static void selectionSort(T* a, int n) {
+    for (int i = 0; i < n-1; ++i) {
+        int m = i;
+        for (int j = i+1; j < n; ++j) if (a[j] < a[m]) m = j;
+        if (m != i) std::swap(a[i], a[m]);
     }
 }
 
-// Selection Sort
-void selectionSort(int arr[], int n) {
-    for (int i = 0; i < n - 1; i++) {
-        int minIndex = i;
-        for (int j = i + 1; j < n; j++)
-            if (arr[j] < arr[minIndex])
-                minIndex = j;
-
-        int tmp = arr[i];
-        arr[i] = arr[minIndex];
-        arr[minIndex] = tmp;
-    }
-}
-
-// Quick Sort
-int partition(int arr[], int low, int high) {
-    int pivot = arr[high];
-    int i = low - 1;
-
-    for (int j = low; j < high; j++) {
-        if (arr[j] < pivot) {
-            i++;
-            int t = arr[i];
-            arr[i] = arr[j];
-            arr[j] = t;
+template<typename T>
+static void shellSort(T* a, int n) {
+    static const int GAPS[] = {701,301,132,57,23,10,4,1};
+    for (int gap : GAPS) {
+        for (int i = gap; i < n; ++i) {
+            T tmp = a[i]; int j = i;
+            while (j >= gap && a[j-gap] > tmp) { a[j] = a[j-gap]; j -= gap; }
+            a[j] = tmp;
         }
     }
-
-    int t = arr[i + 1];
-    arr[i + 1] = arr[high];
-    arr[high] = t;
-
-    return i + 1;
 }
 
-void quickSortRec(int arr[], int low, int high) {
-    if (low < high) {
-        int pi = partition(arr, low, high);
-        quickSortRec(arr, low, pi - 1);
-        quickSortRec(arr, pi + 1, high);
+template<typename T>
+static void qsImpl(T* a, int lo, int hi) {
+    if (hi - lo < 16) { insertionSort(a + lo, hi - lo + 1); return; }
+
+    int mid = lo + (hi - lo) / 2;
+    if (a[lo]  > a[mid]) std::swap(a[lo],  a[mid]);
+    if (a[lo]  > a[hi])  std::swap(a[lo],  a[hi]);
+    if (a[mid] > a[hi])  std::swap(a[mid], a[hi]);
+    std::swap(a[mid], a[hi-1]);
+    T pivot = a[hi-1];
+
+    int i = lo, j = hi - 1;
+    for (;;) {
+        while (a[++i] < pivot) {}
+        while (a[--j] > pivot) {}
+        if (i >= j) break;
+        std::swap(a[i], a[j]);
+    }
+    std::swap(a[i], a[hi-1]);
+    qsImpl(a, lo, i-1);
+    qsImpl(a, i+1, hi);
+}
+
+template<typename T>
+static void quickSort(T* a, int n) {
+    if (n < 2)  return;
+    if (n < 16) { insertionSort(a, n); return; }
+    qsImpl(a, 0, n-1);
+}
+
+template<typename T>
+static void doMerge(T* a, int l, int m, int r) {
+    std::vector<T> buf(a + l, a + m + 1);
+    int i = 0, j = m + 1, k = l;
+    while (i < (int)buf.size() && j <= r)
+        a[k++] = (buf[i] <= a[j]) ? buf[i++] : a[j++];
+    while (i < (int)buf.size()) a[k++] = buf[i++];
+}
+
+template<typename T>
+static void msImpl(T* a, int l, int r) {
+    if (l >= r) return;
+    int m = l + (r - l) / 2;
+    msImpl(a, l, m);
+    msImpl(a, m+1, r);
+    doMerge(a, l, m, r);
+}
+
+template<typename T>
+static void mergeSort(T* a, int n) {
+    if (n < 2) return;
+    msImpl(a, 0, n-1);
+}
+
+template<typename T>
+static void siftDown(T* a, int n, int i) {
+    for (;;) {
+        int largest = i, l = 2*i+1, r = 2*i+2;
+        if (l < n && a[l] > a[largest]) largest = l;
+        if (r < n && a[r] > a[largest]) largest = r;
+        if (largest == i) break;
+        std::swap(a[i], a[largest]);
+        i = largest;
     }
 }
 
-void quickSortWrapper(int arr[], int n) {
-    quickSortRec(arr, 0, n - 1);
+template<typename T>
+static void heapSort(T* a, int n) {
+    for (int i = n/2-1; i >= 0; --i) siftDown(a, n, i);
+    for (int i = n-1;   i >  0; --i) { std::swap(a[0], a[i]); siftDown(a, i, 0); }
 }
 
-// Merge Sort
-void merge(int arr[], int l, int m, int r) {
-    int n1 = m - l + 1;
-    int n2 = r - m;
-
-    int *L = (int *)malloc(n1 * sizeof(int));
-    int *R = (int *)malloc(n2 * sizeof(int));
-
-    for (int i = 0; i < n1; i++) L[i] = arr[l + i];
-    for (int j = 0; j < n2; j++) R[j] = arr[m + 1 + j];
-
-    int i = 0, j = 0, k = l;
-
-    while (i < n1 && j < n2)
-        arr[k++] = (L[i] <= R[j]) ? L[i++] : R[j++];
-
-    while (i < n1) arr[k++] = L[i++];
-    while (j < n2) arr[k++] = R[j++];
-
-    free(L);
-    free(R);
-}
-
-void mergeSortRec(int arr[], int l, int r) {
-    if (l < r) {
-        int m = l + (r - l) / 2;
-        mergeSortRec(arr, l, m);
-        mergeSortRec(arr, m + 1, r);
-        merge(arr, l, m, r);
-    }
-}
-
-void mergeSortWrapper(int arr[], int n) {
-    mergeSortRec(arr, 0, n - 1);
-}
-
-// Heap Sort
-void heapify(int arr[], int n, int i) {
-    int largest = i;
-    int left = 2 * i + 1;
-    int right = 2 * i + 2;
-
-    if (left < n && arr[left] > arr[largest]) largest = left;
-    if (right < n && arr[right] > arr[largest]) largest = right;
-
-    if (largest != i) {
-        int t = arr[i];
-        arr[i] = arr[largest];
-        arr[largest] = t;
-        heapify(arr, n, largest);
-    }
-}
-
-void heapSort(int arr[], int n) {
-    for (int i = n / 2 - 1; i >= 0; i--)
-        heapify(arr, n, i);
-
-    for (int i = n - 1; i > 0; i--) {
-        int t = arr[0];
-        arr[0] = arr[i];
-        arr[i] = t;
-        heapify(arr, i, 0);
-    }
-}
-
-// Radix Sort
-int max_element(int arr[], int n) {
-    int maxVal = arr[0];
-    for (int i = 1; i < n; i++)
-        if (arr[i] > maxVal)
-            maxVal = arr[i];
-    return maxVal;
-}
-
-void countingSort(int arr[], int n, int exp) {
-    int *output = (int *)malloc(n * sizeof(int));
-    int count[10] = {0};
-
-    for (int i = 0; i < n; i++)
-        count[(arr[i] / exp) % 10]++;
-
-    for (int i = 1; i < 10; i++)
-        count[i] += count[i - 1];
-
-    for (int i = n - 1; i >= 0; i--) {
-        int digit = (arr[i] / exp) % 10;
-        output[count[digit] - 1] = arr[i];
-        count[digit]--;
-    }
-
-    for (int i = 0; i < n; i++)
-        arr[i] = output[i];
-
-    free(output);
-}
-
-void radixSort(int arr[], int n) {
-    int maxVal = max_element(arr, n);
-    for (int exp = 1; maxVal / exp > 0; exp *= 10)
-        countingSort(arr, n, exp);
-}
-
-// Tim Sort (simplified)
-void timSort(int arr[], int n) {
+template<typename T>
+static void timSort(T* a, int n) {
     const int RUN = 32;
-
-    for (int i = 0; i < n; i += RUN) {
-        int len = (i + RUN < n) ? RUN : (n - i);
-        insertionSort(arr + i, len);
-    }
-
-    for (int size = RUN; size < n; size *= 2) {
-        for (int left = 0; left < n; left += 2 * size) {
-            int mid = left + size - 1;
-            int right = (left + 2 * size - 1 < n - 1)
-                        ? left + 2 * size - 1
-                        : n - 1;
-
-            if (mid < right)
-                merge(arr, left, mid, right);
+    for (int i = 0; i < n; i += RUN)
+        insertionSort(a + i, std::min(RUN, n - i));
+    for (int sz = RUN; sz < n; sz *= 2) {
+        for (int l = 0; l < n; l += 2*sz) {
+            int m = std::min(l + sz - 1,   n - 1);
+            int r = std::min(l + 2*sz - 1, n - 1);
+            if (m < r) doMerge(a, l, m, r);
         }
     }
 }
 
-// ======================================================
-// ARRAY GENERATORS
-// ======================================================
+template<typename T>
+static void stdSort(T* a, int n) { std::sort(a, a+n); }
 
-void generateRandom(int arr[], int n) {
-    for (int i = 0; i < n; i++)
-        arr[i] = rand() % 1000000;
-}
+template<typename T>
+static void parallelSort(T* a, int n) {
+    if (n < PAR_MIN) { std::sort(a, a+n); return; }
 
-void generateSorted(int arr[], int n) {
-    for (int i = 0; i < n; i++)
-        arr[i] = i;
-}
+    int nT    = std::min(N_THREADS, n);
+    int chunk = (n + nT - 1) / nT;
 
-void generateReverse(int arr[], int n) {
-    for (int i = 0; i < n; i++)
-        arr[i] = n - i;
-}
+    {
+        std::vector<std::thread> threads;
+        threads.reserve(nT);
+        for (int t = 0; t < nT; ++t) {
+            int s = t * chunk,  e = std::min(s + chunk, n);
+            if (s >= n) break;
+            threads.emplace_back([=]{ std::sort(a+s, a+e); });
+        }
+        for (auto& th : threads) th.join();
+    }
 
-void generateHalf(int arr[], int n) {
-    for (int i = 0; i < n / 2; i++)
-        arr[i] = i;
-    for (int i = n / 2; i < n; i++)
-        arr[i] = rand() % 1000000;
-}
-
-void generateNearly(int arr[], int n) {
-    generateSorted(arr, n);
-    for (int i = 0; i < n / 10; i++) {
-        int a = rand() % n;
-        int b = rand() % n;
-        int t = arr[a];
-        arr[a] = arr[b];
-        arr[b] = t;
+    for (int w = chunk; w < n; w *= 2) {
+        std::vector<std::thread> threads;
+        for (int i = 0; i < n; i += 2*w) {
+            int mid = std::min(i + w, n);
+            int end = std::min(i + 2*w, n);
+            if (mid < end)
+                threads.emplace_back([=]{ std::inplace_merge(a+i, a+mid, a+end); });
+        }
+        for (auto& th : threads) th.join();
     }
 }
 
-// ======================================================
-// MAIN BENCHMARK
-// ======================================================
+static void lsdRadix32(uint32_t* a, int n) {
+    std::vector<uint32_t> buf(n);
+    for (int shift = 0; shift < 32; shift += 8) {
+        uint32_t cnt[256] = {};
+        for (int i = 0; i < n; ++i) cnt[(a[i] >> shift) & 0xFF]++;
+        uint32_t acc = 0;
+        for (int i = 0; i < 256; ++i) { uint32_t c = cnt[i]; cnt[i] = acc; acc += c; }
+        for (int i = 0; i < n; ++i)   buf[cnt[(a[i] >> shift) & 0xFF]++] = a[i];
+        std::memcpy(a, buf.data(), n * sizeof(uint32_t));
+    }
+}
 
-int main() {
-    srand(time(NULL));
+static void radixSortInt(int* a, int n) {
+    std::vector<uint32_t> pos, neg;
+    pos.reserve(n); neg.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        if (a[i] >= 0) pos.push_back((uint32_t)a[i]);
+        else           neg.push_back((uint32_t)(-a[i]));
+    }
+    if (!neg.empty()) lsdRadix32(neg.data(), (int)neg.size());
+    if (!pos.empty()) lsdRadix32(pos.data(), (int)pos.size());
 
-    int sizes[] = {20, 50, 100, 500, 1000, 5000, 10000};
-    int numSizes = sizeof(sizes) / sizeof(sizes[0]);
+    int k = 0;
+    for (int i = (int)neg.size()-1; i >= 0; --i) a[k++] = -(int)neg[i];
+    for (auto v : pos)                            a[k++] = (int)v;
+}
 
-    FILE *out = fopen("sorting_results.csv", "w");
-    fprintf(out, "Size,Algorithm,Random,Sorted,Reverse,Half,Nearly\n");
+static void radixSortFloat(float* a, int n) {
+    std::vector<uint32_t> keys(n);
+    for (int i = 0; i < n; ++i) {
+        uint32_t b; std::memcpy(&b, &a[i], 4);
+        keys[i] = (b >> 31) ? ~b : (b ^ 0x80000000u);
+    }
+    lsdRadix32(keys.data(), n);
+    for (int i = 0; i < n; ++i) {
+        uint32_t b = keys[i];
+        b = (b >> 31) ? (b ^ 0x80000000u) : ~b;
+        std::memcpy(&a[i], &b, 4);
+    }
+}
 
-    struct {
-        const char *name;
-        void (*func)(int[], int);
-    } algos[] = {
-        {"Insertion Sort", insertionSort},
-        {"Selection Sort", selectionSort},
-        {"Quick Sort",    quickSortWrapper},
-        {"Merge Sort",    mergeSortWrapper},
-        {"Heap Sort",     heapSort},
-        {"Radix Sort",    radixSort},
-        {"Tim Sort",      timSort}
-    };
+static void countingSortChar(signed char* a, int n) {
+    int cnt[256] = {};
+    for (int i = 0; i < n; ++i) cnt[(unsigned char)(a[i] + 128)]++;
+    int k = 0;
+    for (int v = 0; v < 256; ++v)
+        for (int c = cnt[v]; c--;) a[k++] = (signed char)(v - 128);
+}
 
-    int numAlgos = sizeof(algos) / sizeof(algos[0]);
+static std::mt19937 RNG(0xDEADBEEF);
 
-    for (int s = 0; s < numSizes; s++) {
-        int n = sizes[s];
+template<typename T> static void genRandom(T*, int);
+template<> void genRandom<int>(int* a, int n) {
+    std::uniform_int_distribution<int> d(INT_MIN/2, INT_MAX/2);
+    for (int i = 0; i < n; ++i) a[i] = d(RNG);
+}
+template<> void genRandom<signed char>(signed char* a, int n) {
+    std::uniform_int_distribution<int> d(-128, 127);
+    for (int i = 0; i < n; ++i) a[i] = (signed char)d(RNG);
+}
+template<> void genRandom<float>(float* a, int n) {
+    std::uniform_real_distribution<float> d(-1e6f, 1e6f);
+    for (int i = 0; i < n; ++i) a[i] = d(RNG);
+}
 
-        int *base = (int *)malloc(n * sizeof(int));
-        int *arr  = (int *)malloc(n * sizeof(int));
+template<typename T> static void genSorted (T* a, int n) { genRandom(a,n); std::sort(a,a+n); }
+template<typename T> static void genReverse(T* a, int n) { genSorted(a,n); std::reverse(a,a+n); }
+template<typename T> static void genHalf   (T* a, int n) {
+    genSorted(a, n/2);
+    genRandom(a + n/2, n - n/2);
+}
+template<typename T> static void genNearly (T* a, int n) {
+    genSorted(a, n);
+    std::uniform_int_distribution<int> d(0, n-1);
+    for (int i = 0, s = std::max(1, n/10); i < s; ++i)
+        std::swap(a[d(RNG)], a[d(RNG)]);
+}
 
-        for (int a = 0; a < numAlgos; a++) {
-            double t[5];
+template<typename T>
+struct Algo {
+    std::string              name;
+    std::function<void(T*,int)> fn;
+    bool                     quadratic; 
+};
 
-            void (*gens[5])(int[], int) = {
-                generateRandom,
-                generateSorted,
-                generateReverse,
-                generateHalf,
-                generateNearly
-            };
+template<typename T>
+static void runBenchmark(const std::string&  typeName,
+                         std::ofstream&       csv,
+                         std::vector<Algo<T>>& algos)
+{
+    using GenFn = void(*)(T*, int);
+    static GenFn gens[]       = { genRandom<T>, genSorted<T>, genReverse<T>, genHalf<T>, genNearly<T> };
+    static const char* labels[] = { "Random",    "Sorted",     "Reverse",     "Half",     "Nearly"     };
 
-            const char *types[5] = {
-                "Random", "Sorted", "Reverse", "Half", "Nearly"
-            };
+    struct State { double lastTimes[5]; int lastN; };
+    std::vector<State> st(algos.size(), State{{0,0,0,0,0}, 0});
 
-            for (int g = 0; g < 5; g++) {
-                printf("[SIZE %d] Running %s on %s...\n",
-                       n, algos[a].name, types[g]);
+    for (int n : SIZES) {
+        std::vector<T> base(n), arr(n);
 
-                gens[g](base, n);
-                memcpy(arr, base, n * sizeof(int));
+        for (int ai = 0; ai < (int)algos.size(); ++ai) {
+            auto& algo = algos[ai];
+            bool isEst = algo.quadratic && n > N2_THRESHOLD && st[ai].lastN > 0;
+            double times[5];
 
-                t[g] = measure(algos[a].func, arr, n);
-
-                printf("[SIZE %d] %s on %s completed in %.6f s\n",
-                       n, algos[a].name, types[g], t[g]);
+            if (isEst) {
+                double ratio = (double)n / st[ai].lastN;
+                for (int g = 0; g < 5; ++g)
+                    times[g] = st[ai].lastTimes[g] * ratio * ratio;
+            } else {
+                for (int g = 0; g < 5; ++g) {
+                    gens[g](base.data(), n);
+                    arr = base;
+                    times[g] = measure_ms([&]{ algo.fn(arr.data(), n); });
+                }
+                for (int g = 0; g < 5; ++g) st[ai].lastTimes[g] = times[g];
+                st[ai].lastN = n;
             }
 
-            fprintf(out, "%d,%s,%.6f,%.6f,%.6f,%.6f,%.6f\n",
-                    n, algos[a].name,
-                    t[0], t[1], t[2], t[3], t[4]);
-        }
+            std::cout << "[" << std::setw(10) << typeName << "]"
+                      << " n=" << std::setw(10) << n
+                      << "  " << algo.name
+                      << (isEst ? "  [est~]" : "") << "\n";
 
-        free(base);
-        free(arr);
+            csv << typeName << "," << n << ",\"" << algo.name << "\"";
+            for (int g = 0; g < 5; ++g)
+                csv << "," << std::fixed << std::setprecision(4) << times[g];
+            csv << "," << (isEst ? 1 : 0) << "\n";
+        }
+    }
+}
+
+int main() {
+    std::ofstream csv("sorting_results.csv");
+    if (!csv) { std::cerr << "Cannot open output file.\n"; return 1; }
+
+    csv << "DataType,Size,Algorithm,Random_ms,Sorted_ms,Reverse_ms,Half_ms,Nearly_ms,Est\n";
+
+    std::cout << "Threads : " << N_THREADS    << "\n"
+              << "O(n²) cutoff : n=" << N2_THRESHOLD << " (larger sizes extrapolated)\n\n";
+
+    {
+        std::vector<Algo<int>> algos = {
+            {"Insertion Sort", insertionSort<int>,                             true  },
+            {"Selection Sort", selectionSort<int>,                             true  },
+            {"Shell Sort",     shellSort<int>,                                 false },
+            {"Quick Sort",     quickSort<int>,                                 false },
+            {"Merge Sort",     mergeSort<int>,                                 false },
+            {"Heap Sort",      heapSort<int>,                                  false },
+            {"Tim Sort",       timSort<int>,                                   false },
+            {"Radix Sort",     [](int* a,int n){ radixSortInt(a,n); },        false },
+            {"std::sort",      stdSort<int>,                                   false },
+            {"Parallel Sort",  parallelSort<int>,                              false },
+        };
+        runBenchmark<int>("int32", csv, algos);
     }
 
-    fclose(out);
+    {
+        std::vector<Algo<signed char>> algos = {
+            {"Insertion Sort", insertionSort<signed char>,                              true  },
+            {"Selection Sort", selectionSort<signed char>,                              true  },
+            {"Shell Sort",     shellSort<signed char>,                                  false },
+            {"Quick Sort",     quickSort<signed char>,                                  false },
+            {"Merge Sort",     mergeSort<signed char>,                                  false },
+            {"Heap Sort",      heapSort<signed char>,                                   false },
+            {"Tim Sort",       timSort<signed char>,                                    false },
+            {"Counting Sort",  [](signed char* a,int n){ countingSortChar(a,n); },     false },
+            {"std::sort",      stdSort<signed char>,                                    false },
+            {"Parallel Sort",  parallelSort<signed char>,                               false },
+        };
+        runBenchmark<signed char>("char", csv, algos);
+    }
+
+    {
+        std::vector<Algo<float>> algos = {
+            {"Insertion Sort", insertionSort<float>,                               true  },
+            {"Selection Sort", selectionSort<float>,                               true  },
+            {"Shell Sort",     shellSort<float>,                                   false },
+            {"Quick Sort",     quickSort<float>,                                   false },
+            {"Merge Sort",     mergeSort<float>,                                   false },
+            {"Heap Sort",      heapSort<float>,                                    false },
+            {"Tim Sort",       timSort<float>,                                     false },
+            {"Radix Sort",     [](float* a,int n){ radixSortFloat(a,n); },        false },
+            {"std::sort",      stdSort<float>,                                     false },
+            {"Parallel Sort",  parallelSort<float>,                                false },
+        };
+        runBenchmark<float>("float32", csv, algos);
+    }
+
+    csv.close();
+    std::cout << "\nDone.  Results written to sorting_results.csv\n";
     return 0;
 }
